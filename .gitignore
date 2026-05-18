@@ -1,0 +1,29 @@
+# Environments
+env/
+venv/
+ENV/
+.env
+
+# Pycache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDEs and Workspace Settings
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# Ignore all video files inside testVideo, but keep the folder in git
+testVideo/*
+!testVideo/.gitkeep
+
+# Ignore output directories and generated videos
+outputVideo/
+*.mp4
+*.avi
