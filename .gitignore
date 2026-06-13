@@ -18,12 +18,17 @@ __pycache__/
 *.njsproj
 *.sln
 *.swp
-
-# Ignore all video files inside testVideo, but keep the folder in git
-testVideo/*
-!testVideo/.gitkeep
-
-# Ignore output directories and generated videos
+# Ignore test videos and output folders completely
+testVideo/
+testVideo2/
+testvideo2/
+textvideo2/
+output/
 outputVideo/
+
+# Ignore compiled video assets
 *.mp4
 *.avi
+*.mov
+*.mkv
+*.webm

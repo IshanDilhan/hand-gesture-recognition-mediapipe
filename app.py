@@ -1,35 +1,25 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-🤖 HRI Gesture Recognition — Real-time Application (High-Accuracy Webcam Edition)
-=================================================================================
+🤖 HRI Gesture Recognition — Real-time Application (TFLite Model Edition)
+========================================================================
 Highly robust, real-time hand gesture recognition system designed for HRI.
-Uses MediaPipe Hands for skeletal tracking and a precision rule-based classifier.
-
-Optimized for Webcams:
-  1. Uses the webcam's native resolution and aspect ratio (prevents distortion).
-  2. Uses full-complexity MediaPipe tracking (model_complexity=1) for maximum accuracy.
-  3. Implements distance-based stable hand tracking (prevents index swapping during waves).
-  4. Matches the highly accurate 'new_gesture' pipeline exactly.
+Uses MediaPipe Hands for skeletal tracking and a precision TFLite MLP model.
+Optimized for deployment on Jetson Orin Nano.
+Features real-time landmark smoothing and rotation-invariant pointing logic.
 """
 
+import csv
 import copy
 import argparse
 import collections
 import time
+import itertools
 import cv2 as cv
 import numpy as np
 import mediapipe as mp
 from utils import CvFpsCalc
-
-
-def get_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--device", type=int, default=0, help="Camera index")
-    parser.add_argument("--min_detection_confidence", type=float, default=0.6)
-    parser.add_argument("--min_tracking_confidence", type=float, default=0.6)
-    return parser.parse_args()
-
+from model import KeyPointClassifier
 
 # ── Finger Joint Constants ──────────────────────────────────────────────────
 WRIST = 0
@@ -43,50 +33,34 @@ PINKY_TIP = 20
 PINKY_MCP = 17
 
 
-# ── Feature Extractors ───────────────────────────────────────────────────────
+# ── Feature Extractors & Preprocessing ───────────────────────────────────────
 
-def finger_up(lm, tip, mcp):
-    """Returns True if the finger tip is above its MCP joint (y-axis)."""
-    return lm[tip].y < lm[mcp].y
+def calc_landmark_list(image, landmarks):
+    image_width, image_height = image.shape[1], image.shape[0]
+    landmark_point = []
+    for _, landmark in enumerate(landmarks.landmark):
+        landmark_x = min(int(landmark.x * image_width), image_width - 1)
+        landmark_y = min(int(landmark.y * image_height), image_height - 1)
+        landmark_point.append([landmark_x, landmark_y])
+    return landmark_point
 
 
-def count_fingers_up(lm):
-    """Count open fingers excluding thumb (index, middle, ring, pinky)."""
-    fingers = [
-        finger_up(lm, INDEX_TIP, INDEX_MCP),
-        finger_up(lm, MIDDLE_TIP, MIDDLE_MCP),
-        finger_up(lm, RING_TIP, RING_MCP),
-        finger_up(lm, PINKY_TIP, PINKY_MCP),
-    ]
-    return sum(fingers), fingers
+def pre_process_landmark(landmark_list):
+    temp_landmark_list = copy.deepcopy(landmark_list)
+    base_x, base_y = temp_landmark_list[0][0], temp_landmark_list[0][1]
+    for index, _ in enumerate(temp_landmark_list):
+        temp_landmark_list[index][0] -= base_x
+        temp_landmark_list[index][1] -= base_y
+    temp_landmark_list = list(itertools.chain.from_iterable(temp_landmark_list))
+    max_value = max(list(map(abs, temp_landmark_list)))
+    if max_value == 0:
+        return temp_landmark_list
+    return [n / max_value for n in temp_landmark_list]
 
 
 def hand_y_norm(lm):
     """Average y of all landmarks. Lower y = hand is higher in the frame."""
     return np.mean([l.y for l in lm])
-
-
-def classify_single_hand(lm):
-    """Accurate rule-based gesture classifier for a single hand."""
-    n_up, fingers = count_fingers_up(lm)
-    idx_up, mid_up, ring_up, pinky_up = fingers
-
-    # Pointing: only index is up, rest curled
-    if idx_up and not mid_up and not ring_up and not pinky_up:
-        return "Pointing"
-
-    # OPEN: 4 fingers extended
-    if n_up >= 4:
-        return "OPEN"
-
-    # Beckoning pre-check: Index extended but curled down
-    pip_y = lm[6].y
-    tip_y = lm[INDEX_TIP].y
-    if idx_up and not mid_up and not ring_up:
-        if abs(tip_y - pip_y) < 0.06:
-            return "Beckoning"
-
-    return "None"
 
 
 # ── Stable Distance-Based Motion Tracker ─────────────────────────────────────
@@ -95,27 +69,25 @@ class HandMotionTracker:
     def __init__(self):
         # Stably track up to 2 hands using spatial coordinates
         self.x_hist = {0: collections.deque(maxlen=25), 1: collections.deque(maxlen=25)}
+        self.y_hist = {0: collections.deque(maxlen=25), 1: collections.deque(maxlen=25)}
         self.beck_hist = {0: collections.deque(maxlen=15), 1: collections.deque(maxlen=15)}
         self.last_positions = {0: None, 1: None}
 
     def get_track_id(self, wx, wy):
         """Assign ID (0 or 1) based on proximity to previous frame's hand coordinates."""
-        # 1. If both slots are empty, assign to 0
         if self.last_positions[0] is None and self.last_positions[1] is None:
             self.last_positions[0] = (wx, wy)
             return 0
 
-        # 2. If only slot 0 is active
         if self.last_positions[0] is not None and self.last_positions[1] is None:
             d0 = (wx - self.last_positions[0][0])**2 + (wy - self.last_positions[0][1])**2
-            if d0 < 0.06:  # Proximity threshold
+            if d0 < 0.06:
                 self.last_positions[0] = (wx, wy)
                 return 0
             else:
                 self.last_positions[1] = (wx, wy)
                 return 1
 
-        # 3. If only slot 1 is active
         if self.last_positions[0] is None and self.last_positions[1] is not None:
             d1 = (wx - self.last_positions[1][0])**2 + (wy - self.last_positions[1][1])**2
             if d1 < 0.06:
@@ -125,7 +97,6 @@ class HandMotionTracker:
                 self.last_positions[0] = (wx, wy)
                 return 0
 
-        # 4. If both are active, match the closest one
         d0 = (wx - self.last_positions[0][0])**2 + (wy - self.last_positions[0][1])**2
         d1 = (wx - self.last_positions[1][0])**2 + (wy - self.last_positions[1][1])**2
         if d0 < d1:
@@ -135,9 +106,33 @@ class HandMotionTracker:
             self.last_positions[1] = (wx, wy)
             return 1
 
-    def update(self, hand_id, wx, beck_angle):
+    def update(self, hand_id, wx, wy, beck_angle):
         self.x_hist[hand_id].append(wx)
+        self.y_hist[hand_id].append(wy)
         self.beck_hist[hand_id].append(beck_angle)
+
+    def is_raised(self, hand_id, current_hy):
+        """
+        Check if the hand is raised.
+        Returns True if:
+        1. The hand is currently very high in the frame (static hold: current_hy < 0.35)
+        2. OR the hand has recently moved from a lower position to a higher position (dynamic raise).
+        """
+        if current_hy < 0.35:
+            return True
+        h = self.y_hist[hand_id]
+        if len(h) < 10:
+            return current_hy < 0.42
+        
+        arr = list(h)
+        first_half = arr[:len(arr)//2]
+        max_past_y = max(first_half) # Lowest position in the past (highest y coordinate)
+        current_y = arr[-1]          # Current position
+        
+        # If it moved up by at least 0.12 and is now high in the frame
+        if (max_past_y - current_y) > 0.12 and current_y < 0.45:
+            return True
+        return current_hy < 0.42
 
     def is_waving(self, hand_id):
         h = self.x_hist[hand_id]
@@ -164,13 +159,16 @@ class HandMotionTracker:
         diffs = np.diff(arr)
         reversals = int(np.sum(np.diff(np.sign(diffs)) != 0))
 
-        return excursion > 0.04 and reversals >= 2
+        return excursion > 0.15 and reversals >= 2
 
     def reset_inactive(self, active_ids):
         """Clear tracking history for hands that disappeared from the frame."""
         for i in [0, 1]:
             if i not in active_ids:
                 self.last_positions[i] = None
+                self.x_hist[i].clear()
+                self.y_hist[i].clear()
+                self.beck_hist[i].clear()
 
 
 # ── Gesture Engine ──────────────────────────────────────────────────────────
@@ -186,12 +184,23 @@ class GestureEngine:
         "Beckoning": (100, 255, 220),
         "Arms Up": (0, 100, 255),
         "No hands": (80, 80, 80),
+        "Thumbs up": (0, 255, 0),
+        "Thumbs down": (0, 0, 255),
     }
 
     def __init__(self):
         self.tracker = HandMotionTracker()
         self.last_gesture = "None"
         self.last_time = time.time()
+        
+        # Landmark smoothing state (Exponential Moving Average)
+        self.smoothed_landmarks = {0: None, 1: None}
+        self.alpha = 0.45  # 0.45 smoothing factor yields smooth coordinates with minimal lag
+
+        # Initialize TFLite model classifier
+        self.keypoint_classifier = KeyPointClassifier()
+        with open('model/keypoint_classifier/keypoint_classifier_label.csv', encoding='utf-8-sig') as f:
+            self.keypoint_labels = [row[0] for row in csv.reader(f)]
 
     def stable_update(self, gesture):
         now = time.time()
@@ -201,9 +210,12 @@ class GestureEngine:
                 self.last_time = now
         return self.last_gesture
 
-    def process(self, hand_results):
+    def process(self, hand_results, frame_shape):
         if not hand_results:
             self.tracker.reset_inactive([])
+            # Reset smoothing states
+            for i in [0, 1]:
+                self.smoothed_landmarks[i] = None
             return self.stable_update("No hands"), self.GESTURE_COLORS["No hands"]
 
         n_hands = len(hand_results)
@@ -212,26 +224,69 @@ class GestureEngine:
 
         for hl in hand_results:
             lm = hl.landmark
-            base = classify_single_hand(lm)
-            hy = hand_y_norm(lm)
             wx = lm[WRIST].x
             wy = lm[WRIST].y
-            beck_a = lm[INDEX_TIP].y - lm[6].y
 
             # Compute stable spatial ID
             hand_id = self.tracker.get_track_id(wx, wy)
             active_ids.append(hand_id)
 
-            self.tracker.update(hand_id, wx, beck_a)
+            # ── Real-time Landmark Smoothing Filter ──
+            raw_landmark_list = calc_landmark_list(np.zeros(frame_shape), hl)
+            if self.smoothed_landmarks[hand_id] is None:
+                self.smoothed_landmarks[hand_id] = raw_landmark_list
+            else:
+                self.smoothed_landmarks[hand_id] = [
+                    [
+                        int(self.alpha * curr[0] + (1.0 - self.alpha) * prev[0]),
+                        int(self.alpha * curr[1] + (1.0 - self.alpha) * prev[1])
+                    ]
+                    for curr, prev in zip(raw_landmark_list, self.smoothed_landmarks[hand_id])
+                ]
+            smoothed_list = self.smoothed_landmarks[hand_id]
+
+            # Write smoothed coordinates back to MediaPipe's landmarks so drawing utility remains stable
+            for idx, pt in enumerate(smoothed_list):
+                hl.landmark[idx].x = pt[0] / frame_shape[1]
+                hl.landmark[idx].y = pt[1] / frame_shape[0]
+
+            hy = hand_y_norm(hl.landmark)
+            
+            # Calculate hand scale (distance from Wrist to Middle MCP)
+            w_x, w_y = hl.landmark[WRIST].x, hl.landmark[WRIST].y
+            m_x, m_y = hl.landmark[9].x, hl.landmark[9].y
+            hand_scale = np.sqrt((w_x - m_x)**2 + (w_y - m_y)**2)
+            if hand_scale == 0:
+                hand_scale = 1.0
+            
+            beck_a = (hl.landmark[INDEX_TIP].y - hl.landmark[6].y) / hand_scale
+
+            # Predict static pose index using TFLite model on smoothed coordinates
+            pre_processed_landmark_list = pre_process_landmark(smoothed_list)
+            hand_sign_id, hand_sign_conf = self.keypoint_classifier(pre_processed_landmark_list)
+
+            # Filter low-confidence predictions
+            if hand_sign_id in [2, 3, 4, 5] and hand_sign_conf < 0.80:
+                hand_sign_id = -1
+
+            # Update tracker history
+            track_wx = wx if hand_sign_id in [0, 1, 2, 5, -1] else wx
+            track_beck = beck_a if hand_sign_id in [0, 1, 5, -1] else 0
+            self.tracker.update(hand_id, track_wx, hy, track_beck)
 
             per_hand.append({
-                'base': base,
+                'sign': hand_sign_id,
+                'sign_conf': hand_sign_conf,
                 'hy': hy,
                 'wx': wx,
                 'id': hand_id,
-                'lm': lm
+                'lm': hl.landmark
             })
 
+        # Clear inactive hands' smoothing states
+        for i in [0, 1]:
+            if i not in active_ids:
+                self.smoothed_landmarks[i] = None
         self.tracker.reset_inactive(active_ids)
 
         # ── Two-Hand Scenarios (Arms Up / Arms Waving) ──────────────────────
@@ -239,13 +294,13 @@ class GestureEngine:
             h0 = per_hand[0]
             h1 = per_hand[1]
 
-            # Arms Up: Both hands open and held high (y < 0.42)
-            both_open = (h0['base'] == "OPEN" and h1['base'] == "OPEN")
-            both_high = (h0['hy'] < 0.42 and h1['hy'] < 0.42)
-            if both_open and both_high:
+            h0_raised = self.tracker.is_raised(h0['id'], h0['hy'])
+            h1_raised = self.tracker.is_raised(h1['id'], h1['hy'])
+            both_high = h0_raised and h1_raised
+            both_raising_poses = (h0['sign'] in [0, 1, -1] and h1['sign'] in [0, 1, -1])
+            if both_raising_poses and both_high:
                 return self.stable_update("Arms Up"), self.GESTURE_COLORS["Arms Up"]
 
-            # Arms Waving: Both hands waving
             w0, bw0 = self.tracker.is_waving(h0['id'])
             w1, bw1 = self.tracker.is_waving(h1['id'])
             if (w0 or bw0) and (w1 or bw1):
@@ -253,26 +308,38 @@ class GestureEngine:
 
         # ── Single-Hand Scenarios (Using dominant hand - the highest hand) ───
         primary = min(per_hand, key=lambda x: x['hy'])
-        base = primary['base']
+        sign = primary['sign']
         hy = primary['hy']
         hid = primary['id']
 
         is_wave, is_brief = self.tracker.is_waving(hid)
 
-        if base == "Beckoning" or self.tracker.is_beckoning(hid):
+        # Beckoning
+        if sign == 5 or self.tracker.is_beckoning(hid):
             return self.stable_update("Beckoning"), self.GESTURE_COLORS["Beckoning"]
 
-        if is_wave and base == "OPEN":
+        # Wave
+        if is_wave and sign == 0:
             return self.stable_update("Wave"), self.GESTURE_COLORS["Wave"]
 
-        if is_brief and base == "OPEN":
+        # Brief Wave
+        if is_brief and sign == 0:
             return self.stable_update("Brief Wave"), self.GESTURE_COLORS["Brief Wave"]
 
-        if base == "Pointing":
+        # Pointing
+        if sign == 2:
             return self.stable_update("Pointing"), self.GESTURE_COLORS["Pointing"]
 
-        # One Hand Raised: Open hand held high, stationary
-        if base == "OPEN" and hy < 0.45:
+        # Thumbs up
+        if sign == 3:
+            return self.stable_update("Thumbs up"), self.GESTURE_COLORS["Thumbs up"]
+
+        # Thumbs down
+        if sign == 4:
+            return self.stable_update("Thumbs down"), self.GESTURE_COLORS["Thumbs down"]
+
+        # One Hand Raised: Open hand, fist, or unknown held high, stationary
+        if sign in [0, 1, -1] and self.tracker.is_raised(hid, hy):
             return self.stable_update("One Hand Raised"), self.GESTURE_COLORS["One Hand Raised"]
 
         return self.stable_update("None"), self.GESTURE_COLORS["None"]
@@ -297,7 +364,7 @@ def draw_overlay(frame, label, color):
     cv.rectangle(overlay, (0, 0), (w, 75), (15, 15, 15), -1)
     cv.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
 
-    cv.putText(frame, "HRI WEBCAM GESTURE DETECTOR  |  ACCURATE",
+    cv.putText(frame, "HRI WEBCAM GESTURE DETECTOR  |  TFLITE SMOOTHED",
                 (12, 22), cv.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1, cv.LINE_AA)
     cv.putText(frame, label,
                 (12, 62), cv.FONT_HERSHEY_DUPLEX, 1.4, color, 2, cv.LINE_AA)
@@ -309,16 +376,17 @@ def draw_overlay(frame, label, color):
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
-    args = get_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", type=int, default=0, help="Camera index")
+    parser.add_argument("--min_detection_confidence", type=float, default=0.45)
+    parser.add_argument("--min_tracking_confidence", type=float, default=0.45)
+    args = parser.parse_args()
 
-    # Match 'new_gesture' behavior: do not force arbitrary camera resolution limits
-    # which stretch, crop, or lower frames on various webcams. Let it use its native mode.
     cap = cv.VideoCapture(args.device)
 
     mp_hands = mp.solutions.hands
     mp_draw = mp.solutions.drawing_utils
 
-    # Set full complexity (model_complexity=1) for maximum accuracy on webcam
     hands = mp_hands.Hands(
         model_complexity=1,
         static_image_mode=False,
@@ -340,26 +408,25 @@ def main():
         if not ret:
             break
 
-        # Process exactly as received (no arbitrary pre-flips to ensure MediaPipe behaves properly)
         fps = cvFpsCalc.get()
         rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
         res = hands.process(rgb)
 
         if res.multi_hand_landmarks:
+            # First process with GestureEngine to smooth coordinates in-place
+            gesture, color = engine.process(res.multi_hand_landmarks, frame.shape)
+            
+            # Draw overlay, skeleton & bounding boxes using smoothed landmarks
             for hl in res.multi_hand_landmarks:
                 brect = calc_bounding_rect(frame, hl)
-                # Draw skeleton
                 mp_draw.draw_landmarks(
                     frame, hl, mp_hands.HAND_CONNECTIONS,
                     mp_draw.DrawingSpec(color=(0, 255, 150), thickness=2, circle_radius=4),
                     mp_draw.DrawingSpec(color=(0, 200, 100), thickness=2),
                 )
-                # Bounding box
                 cv.rectangle(frame, (brect[0], brect[1]), (brect[2], brect[3]), (0, 255, 0), 1)
-
-            gesture, color = engine.process(res.multi_hand_landmarks)
         else:
-            gesture, color = engine.process(None)
+            gesture, color = engine.process(None, frame.shape)
 
         draw_overlay(frame, gesture, color)
 
@@ -367,7 +434,7 @@ def main():
         cv.putText(frame, f"FPS: {fps}", (frame.shape[1] - 100, 50),
                     cv.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv.LINE_AA)
 
-        cv.imshow("HRI Hand Gesture Detector (Accurate)", frame)
+        cv.imshow("HRI Hand Gesture Detector (TFLite)", frame)
 
         key = cv.waitKey(1) & 0xFF
         if key in (27, ord('q')):

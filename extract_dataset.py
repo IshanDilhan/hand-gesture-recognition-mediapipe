@@ -27,7 +27,7 @@ import mediapipe as mp
 def get_args():
     parser = argparse.ArgumentParser(description='Extract HaGRID dataset to keypoint.csv')
     parser.add_argument('--dataset_path', type=str,
-                        default='../gesture/gesture_detection/dataset/extracted/hagrid-sample-30k-384p/hagrid_30k',
+                        default='D:/FYP/FYP_Tranformer/ourModelsprojects/gesture/gesture_detection/dataset/extracted/hagrid-sample-30k-384p/hagrid_30k',
                         help='Path to HaGRID image folders')
     parser.add_argument('--csv_path', type=str,
                         default='model/keypoint_classifier/keypoint.csv',
@@ -70,17 +70,19 @@ def main():
     args = get_args()
 
     # === HaGRID Folder → Label Mapping ===
-    # These folders from HaGRID map to our 4 static gesture classes
+    # These folders from HaGRID map to our 6 static gesture classes
     mapping = {
-        'train_val_palm': 0,      # Open (palm/stop) → "One hand raised", "Arms up"
-        'train_val_stop': 0,      # Also Open (stop sign = open palm)
-        'train_val_fist': 1,      # Close (fist) → "None"
-        'train_val_one': 2,       # Pointer (index finger) → "Pointing"
-        'train_val_ok': 3,        # OK gesture
+        'train_val_palm': 0,      # Open Palm
+        'train_val_stop': 0,      # Open Palm (stop sign = open palm)
+        'train_val_fist': 1,      # Close (fist)
+        'train_val_one': 2,       # Pointer (index finger)
+        'train_val_like': 3,      # Thumbs Up
+        'train_val_dislike': 4,   # Thumbs Down
+        'train_val_call': 5,      # Beckoning/Call
     }
 
     print("=" * 60)
-    print("HaGRID → Keypoint CSV Extractor")
+    print("HaGRID -> Keypoint CSV Extractor")
     print("=" * 60)
     print(f"Dataset path: {args.dataset_path}")
     print(f"Output CSV:   {args.csv_path}")
@@ -105,10 +107,10 @@ def main():
         for folder_name, label in mapping.items():
             full_folder_path = os.path.join(args.dataset_path, folder_name)
             if not os.path.exists(full_folder_path):
-                print(f"⚠️  Warning: {full_folder_path} not found. Skipping.")
+                print(f"Warning: {full_folder_path} not found. Skipping.")
                 continue
 
-            print(f"\n🔄 Processing '{folder_name}' → Label {label}...")
+            print(f"\nProcessing '{folder_name}' -> Label {label}...")
             images = sorted([f for f in os.listdir(full_folder_path)
                            if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
 
@@ -148,14 +150,14 @@ def main():
 
                 # Progress indicator
                 if count % 100 == 0 and count > 0:
-                    print(f"   ✅ {count}/{args.max_per_class} samples extracted...")
+                    print(f"   {count}/{args.max_per_class} samples extracted...")
 
             total_samples += count
-            print(f"   ✅ Done! {count} samples extracted, {skipped} images skipped.")
+            print(f"   Done! {count} samples extracted, {skipped} images skipped.")
 
     hands.close()
     print(f"\n{'=' * 60}")
-    print(f"🎉 Extraction complete!")
+    print(f"Extraction complete!")
     print(f"   Total samples: {total_samples}")
     print(f"   Saved to: {args.csv_path}")
     print(f"{'=' * 60}")
